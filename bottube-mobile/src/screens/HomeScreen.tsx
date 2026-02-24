@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import WatchScreen from "./WatchScreen";
 import { SafeAreaView, ScrollView, Text, View, TextInput, Pressable } from "react-native";
 import { getFeed, likeVideo, FeedVideo } from "../api/client";
 import { VideoCard } from "../components/VideoCard";

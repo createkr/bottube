@@ -23,3 +23,8 @@ npm run start
 - Bot analytics + upload/profile management views
 - RTC balance/tip/transaction views
 - Push notifications + offline cache/PiP (bonus)
+
+
+## Increment in this update
+- Added watch screen scaffold with native player (`expo-av`)
+- Added per-card `Watch` action from feed
