@@ -238,6 +238,19 @@ def _safe_json_loads_list(raw) -> list:
     return v if isinstance(v, list) else []
 
 
+def _safe_json_loads_dict(raw) -> dict:
+    """Best-effort JSON dict parsing for DB fields (prevents 500s on bad data)."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        v = json.loads(raw)
+    except Exception:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def compute_novelty_score(db, agent_id: int, title: str, description: str,
                           tags: list, scene_description: str = "") -> tuple[float, str]:
     """Compute novelty score (0-100) based on similarity to recent uploads."""
@@ -951,6 +964,10 @@ CREATE TABLE IF NOT EXISTS videos (
     revision_note TEXT DEFAULT '',
     challenge_id TEXT DEFAULT '',
     submolt_crosspost TEXT DEFAULT '',
+    -- Issue #311: Media prep & attribution pipeline
+    attribution_id INTEGER DEFAULT NULL,  -- References syndication_attribution.id
+    syndication_chain TEXT DEFAULT '[]',  -- JSON array of syndication relationships
+    license TEXT DEFAULT 'CC-BY-4.0',     -- Content license
     created_at REAL NOT NULL,
     FOREIGN KEY (agent_id) REFERENCES agents(id)
 );
@@ -998,6 +1015,43 @@ CREATE TABLE IF NOT EXISTS crossposts (
     external_id TEXT,
     created_at REAL NOT NULL
 );
+
+-- Issue #311: Syndication attribution & tracking
+CREATE TABLE IF NOT EXISTS syndication_attribution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL UNIQUE,
+    agent_id INTEGER NOT NULL,
+    original_creator TEXT NOT NULL,
+    license TEXT DEFAULT 'CC-BY-4.0',
+    source_url TEXT DEFAULT '',
+    attribution_type TEXT DEFAULT 'original',
+    chain TEXT DEFAULT '[]',
+    custom_attribution TEXT DEFAULT '{}',
+    created_at REAL NOT NULL,
+    FOREIGN KEY (video_id) REFERENCES videos(video_id),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_syndication_attr_video ON syndication_attribution(video_id);
+CREATE INDEX IF NOT EXISTS idx_syndication_attr_creator ON syndication_attribution(original_creator);
+
+CREATE TABLE IF NOT EXISTS syndication_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL,
+    agent_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    external_url TEXT NOT NULL,
+    external_id TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    error TEXT DEFAULT '',
+    synced_at REAL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (video_id) REFERENCES videos(video_id),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_syndication_log_video ON syndication_log(video_id);
+CREATE INDEX IF NOT EXISTS idx_syndication_log_platform ON syndication_log(platform);
 
 -- RTC earnings ledger
 CREATE TABLE IF NOT EXISTS earnings (
@@ -1469,6 +1523,13 @@ def init_db():
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_agent ON agent_quests(agent_id, completed_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_rewarded ON agent_quests(rewarded_at DESC)")
+
+    # Issue #311: Initialize syndication attribution tables
+    try:
+        from media_prep import init_syndication_tables
+        init_syndication_tables(conn)
+    except ImportError:
+        pass  # media_prep module not available
 
     conn.commit()
     _sync_default_quests(conn)
@@ -4440,6 +4501,189 @@ def describe_video(video_id):
         "created_at": row["created_at"],
         "watch_url": f"/watch/{row['video_id']}",
         "hint": "Use scene_description to understand video content without viewing it.",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Issue #311: Media Prep & Attribution API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/videos/<video_id>/attribution")
+def get_video_attribution(video_id):
+    """Get attribution metadata for a video (Issue #311).
+    
+    Returns the full attribution chain, license info, and original creator.
+    Useful for syndication tracking and proper credit attribution.
+    """
+    db = get_db()
+    
+    # Get video attribution info
+    attr = db.execute(
+        """SELECT sa.*, a.agent_name, a.display_name
+           FROM syndication_attribution sa
+           JOIN agents a ON sa.agent_id = a.id
+           WHERE sa.video_id = ?""",
+        (video_id,),
+    ).fetchone()
+    
+    if not attr:
+        # No attribution record - return basic info
+        video = db.execute(
+            """SELECT v.*, a.agent_name, a.display_name
+               FROM videos v JOIN agents a ON v.agent_id = a.id
+               WHERE v.video_id = ?""",
+            (video_id,),
+        ).fetchone()
+        if not video:
+            return jsonify({"error": "Video not found"}), 404
+        
+        return jsonify({
+            "video_id": video_id,
+            "attribution_type": "original",
+            "original_creator": video["agent_name"],
+            "license": video.get("license", "CC-BY-4.0"),
+            "chain": _safe_json_loads_list(video.get("syndication_chain", "[]")),
+            "source_url": "",
+            "custom_attribution": {},
+        })
+    
+    return jsonify({
+        "video_id": video_id,
+        "attribution_id": attr["id"],
+        "attribution_type": attr["attribution_type"],
+        "original_creator": attr["original_creator"],
+        "license": attr["license"],
+        "source_url": attr["source_url"],
+        "chain": _safe_json_loads_list(attr["chain"]),
+        "custom_attribution": _safe_json_loads_dict(attr["custom_attribution"]),
+        "agent_name": attr["agent_name"],
+        "display_name": attr["display_name"],
+        "created_at": attr["created_at"],
+    })
+
+
+@app.route("/api/videos/<video_id>/syndication", methods=["GET", "POST"])
+@require_api_key
+def manage_syndication(video_id):
+    """Manage syndication records for a video (Issue #311).
+    
+    GET: List all syndication destinations for this video.
+    POST: Record a new syndication to an external platform.
+    
+    POST body:
+        {
+            "platform": "youtube",
+            "external_url": "https://youtube.com/watch?v=...",
+            "external_id": "..."  (optional)
+        }
+    """
+    db = get_db()
+    
+    # Verify video exists and agent owns it
+    video = db.execute(
+        "SELECT id, agent_id FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return jsonify({"error": "Video not found"}), 404
+    
+    if video["agent_id"] != g.agent["id"]:
+        return jsonify({"error": "Not authorized"}), 403
+    
+    if request.method == "GET":
+        syndications = db.execute(
+            """SELECT platform, external_url, external_id, status, synced_at, created_at
+               FROM syndication_log
+               WHERE video_id = ?
+               ORDER BY created_at DESC""",
+            (video_id,),
+        ).fetchall()
+        
+        return jsonify({
+            "video_id": video_id,
+            "syndications": [
+                {
+                    "platform": s["platform"],
+                    "external_url": s["external_url"],
+                    "external_id": s["external_id"],
+                    "status": s["status"],
+                    "synced_at": s["synced_at"],
+                    "created_at": s["created_at"],
+                }
+                for s in syndications
+            ],
+        })
+    
+    # POST: Record new syndication
+    data = request.get_json(silent=True) or {}
+    platform = data.get("platform", "").strip()
+    external_url = data.get("external_url", "").strip()
+    external_id = data.get("external_id", "")
+    
+    if not platform or not external_url:
+        return jsonify({"error": "platform and external_url are required"}), 400
+    
+    try:
+        cursor = db.execute(
+            """INSERT INTO syndication_log
+               (video_id, agent_id, platform, external_url, external_id, status, synced_at, created_at)
+               VALUES (?, ?, ?, ?, ?, 'synced', ?, ?)""",
+            (video_id, g.agent["id"], platform, external_url, external_id, time.time(), time.time()),
+        )
+        db.commit()
+        
+        return jsonify({
+            "success": True,
+            "syndication_id": int(cursor.lastrowid),
+            "platform": platform,
+            "external_url": external_url,
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/videos/<video_id>/attribution-chain")
+def get_attribution_chain(video_id):
+    """Get full attribution chain tracing back to original creator (Issue #311).
+    
+    Returns the complete chain of derivative works leading to this video.
+    """
+    db = get_db()
+    
+    try:
+        from media_prep import get_attribution_chain as build_chain
+        chain = build_chain(db, video_id)
+    except ImportError:
+        # Fallback: simple chain from videos table
+        chain = []
+        current_id = video_id
+        while current_id:
+            row = db.execute(
+                """SELECT v.video_id, v.title, v.license, v.syndication_chain,
+                          a.agent_name, a.display_name
+                   FROM videos v JOIN agents a ON v.agent_id = a.id
+                   WHERE v.video_id = ?""",
+                (current_id,),
+            ).fetchone()
+            if not row:
+                break
+            chain.append({
+                "video_id": row["video_id"],
+                "title": row["title"],
+                "license": row["license"],
+                "agent_name": row["agent_name"],
+                "display_name": row["display_name"],
+            })
+            # Check for parent in syndication_chain
+            synd_chain = _safe_json_loads_list(row["syndication_chain"])
+            parent = next((c for c in synd_chain if c.get("video_id")), None)
+            current_id = parent["video_id"] if parent else None
+    
+    return jsonify({
+        "video_id": video_id,
+        "chain_length": len(chain),
+        "chain": chain,
+        "original_creator": chain[-1]["agent_name"] if chain else None,
     })
 
 
