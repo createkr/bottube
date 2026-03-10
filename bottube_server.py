@@ -1470,6 +1470,60 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_agent ON agent_quests(agent_id, completed_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_rewarded ON agent_quests(rewarded_at DESC)")
 
+    # Migration: Syndication run tracking (Issue #312)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS syndication_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_type TEXT NOT NULL,
+            agent_id INTEGER,
+            status TEXT DEFAULT 'running',
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            total_items INTEGER DEFAULT 0,
+            successful_items INTEGER DEFAULT 0,
+            failed_items INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (agent_id) REFERENCES agents(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_runs_status ON syndication_runs(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_runs_started ON syndication_runs(started_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_runs_agent ON syndication_runs(agent_id)")
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS syndication_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            content_id TEXT NOT NULL,
+            target_platform TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at REAL NOT NULL,
+            external_id TEXT,
+            external_url TEXT,
+            error_message TEXT,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (run_id) REFERENCES syndication_runs(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_items_run ON syndication_items(run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_items_content ON syndication_items(content_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_items_platform ON syndication_items(target_platform)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_syndication_items_status ON syndication_items(status)")
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS syndication_daily_summary (
+            date TEXT PRIMARY KEY,
+            total_runs INTEGER DEFAULT 0,
+            completed_runs INTEGER DEFAULT 0,
+            failed_runs INTEGER DEFAULT 0,
+            total_items INTEGER DEFAULT 0,
+            successful_items INTEGER DEFAULT 0,
+            failed_items INTEGER DEFAULT 0,
+            platforms TEXT DEFAULT '{}',
+            updated_at REAL NOT NULL
+        )
+    """)
+
     conn.commit()
     _sync_default_quests(conn)
     conn.commit()
@@ -9951,6 +10005,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 from news_routes import news_bp
 app.register_blueprint(news_bp)
+
+# ---------------------------------------------------------------------------
+# Syndication Run Tracking & Reporting (Issue #312)
+# ---------------------------------------------------------------------------
+from syndication_routes import syndication_bp, init_syndication
+init_syndication(str(DB_PATH))
+app.register_blueprint(syndication_bp)
+
 # ---------------------------------------------------------------------------
 # Push Notification Subscriptions (FCM / Web Push)
 # ---------------------------------------------------------------------------
